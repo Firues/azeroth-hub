@@ -569,6 +569,26 @@ func TestPhysicalArchivesMySQLDataItself(t *testing.T) {
 	}
 }
 
+func TestPhysicalCreatesTheBackupsFolderWhenItIsMissing(t *testing.T) {
+	f := newFixture(t)
+	// The folder renamed out of the way a minute ago - the panel's working
+	// folder comes back on its own, like logs\ does.
+	if err := os.RemoveAll(f.backups); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := f.runner.Physical(context.Background())
+	if err != nil {
+		t.Fatalf("Physical: %v", err)
+	}
+	if want := filepath.Join(f.backups, "20260929_120000"+PhysicalSuffix); rep.Dir != want {
+		t.Errorf("Dir = %q, want %q", rep.Dir, want)
+	}
+	if _, err := os.Stat(filepath.Join(rep.Dir, ArchiveName)); err != nil {
+		t.Errorf("архив не появился: %v", err)
+	}
+}
+
 func TestPhysicalAddsACounterWhenTheNameIsTaken(t *testing.T) {
 	f := newFixture(t)
 	// The name the fake clock produces, already taken - two snapshots in one

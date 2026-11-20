@@ -29,11 +29,11 @@ import (
 )
 
 type appFixture struct {
-	app    *App
-	sup    *supervisor.Supervisor
-	ops    *osops.FakeOps
-	clk    *osops.FakeClock
-	sink   *notify.Recorder
+	app  *App
+	sup  *supervisor.Supervisor
+	ops  *osops.FakeOps
+	clk  *osops.FakeClock
+	sink *notify.Recorder
 	// gate, when set, is what the App emits through instead of the bare
 	// recorder - see gateSink.
 	gate   *gateSink

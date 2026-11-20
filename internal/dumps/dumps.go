@@ -154,6 +154,9 @@ func (r *Runner) Logical(ctx context.Context) (Report, error) {
 	rep := Report{Kind: KindLogical}
 	start := r.now()
 
+	if err := r.ensureBackupsDir(); err != nil {
+		return rep, err
+	}
 	if err := r.checkLogical(); err != nil {
 		return rep, err
 	}
@@ -265,6 +268,9 @@ func (r *Runner) Physical(ctx context.Context) (Report, error) {
 	rep := Report{Kind: KindPhysical}
 	start := r.now()
 
+	if err := r.ensureBackupsDir(); err != nil {
+		return rep, err
+	}
 	if err := r.checkPhysical(); err != nil {
 		return rep, err
 	}
@@ -400,6 +406,23 @@ func (r *Runner) makeLogicalDir() (string, error) {
 		}
 	}
 	return "", errors.New(i18n.Tf("dump.names.spent", base, stamp))
+}
+
+// ensureBackupsDir creates the backups folder when it is missing, the way
+// logx creates logs\: a repack without one is not an error, it is a repack
+// nobody has backed up from yet - or one the user renamed a minute ago.
+// An empty path means "no repack was found", which is the check functions'
+// refusal to make, not this helper's. Plain MkdirAll here; the collision
+// handling belongs to the point folders inside, which are still created
+// with Mkdir.
+func (r *Runner) ensureBackupsDir() error {
+	if r.lay.BackupsDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(r.lay.BackupsDir, 0o755); err != nil {
+		return fmt.Errorf("%s: %w", i18n.T("dump.backupsdir.fail"), err)
+	}
+	return nil
 }
 
 // makePhysicalDir creates the folder for a physical point and returns it.
