@@ -1,0 +1,172 @@
+@import 'tailwindcss';
+
+/*
+	Azeroth Hub. One dark theme, gold accent: the shadcn variable names are
+	kept as they are, so every component picked up from the registry looks
+	the way it was designed to, and the launcher look comes from the values
+	below rather than from patches on top of components.
+*/
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+	--radius: 0.5rem;
+
+	--background: #070a0f;
+	--foreground: #e9edf2;
+
+	--card: #111923;
+	--card-foreground: #e9edf2;
+
+	--popover: #151f2b;
+	--popover-foreground: #e9edf2;
+
+	--primary: #c7a15a;
+	--primary-foreground: #16110a;
+
+	--secondary: #17222e;
+	--secondary-foreground: #dfe6ee;
+
+	--muted: #131c26;
+	--muted-foreground: #8d99a8;
+
+	--accent: #1d2a38;
+	--accent-foreground: #e9edf2;
+
+	--destructive: #d86d6d;
+	--destructive-foreground: #fdecec;
+
+	--border: #26313d;
+	--input: #26313d;
+	--ring: #c7a15a;
+
+	/* Not part of shadcn: the gold family the launcher look is built from,
+	   and the two status colours a person reads before reading any words. */
+	--gold: #c7a15a;
+	--gold-bright: #f0d18a;
+	--gold-dim: #75603b;
+	--ice: #72c9ff;
+	--ok: #58d29a;
+	--warn: #e0b34a;
+	--bad: #e07a7a;
+}
+
+@theme inline {
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-destructive-foreground: var(--destructive-foreground);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+
+	--color-gold: var(--gold);
+	--color-gold-bright: var(--gold-bright);
+	--color-gold-dim: var(--gold-dim);
+	--color-ice: var(--ice);
+	--color-ok: var(--ok);
+	--color-warn: var(--warn);
+	--color-bad: var(--bad);
+
+	--radius-sm: calc(var(--radius) - 2px);
+	--radius-md: calc(var(--radius) - 1px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+
+	--font-sans:
+		Inter, 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+}
+
+@layer base {
+	* {
+		border-color: var(--border);
+	}
+
+	html,
+	body,
+	#app {
+		height: 100%;
+	}
+
+	body {
+		background: var(--background);
+		color: var(--foreground);
+		font-family: var(--font-sans);
+		overflow: hidden;
+		/* The background art is drawn once, on the shell, rather than per
+		   card: two radial washes, the way a launcher paints them. */
+		background-image:
+			radial-gradient(900px 520px at 68% -12%, rgba(61, 104, 151, 0.16), transparent 65%),
+			radial-gradient(700px 500px at 12% 88%, rgba(18, 63, 93, 0.14), transparent 70%);
+	}
+
+	::-webkit-scrollbar {
+		width: 10px;
+		height: 10px;
+	}
+	::-webkit-scrollbar-thumb {
+		background: #24303c;
+		border-radius: 999px;
+	}
+	::-webkit-scrollbar-track {
+		background: transparent;
+	}
+}
+
+@layer components {
+	/*
+	  The window has no system frame, so this strip is the frame, and only the
+	  empty part of it may move the window.
+
+	  `--wails-draggable: drag` is read by the Wails runtime, not by the
+	  browser: on a press that starts inside an element carrying it, the
+	  runtime calls the Win32 window drag instead of selecting text. It is not
+	  standard CSS, so it cannot live in a Tailwind utility or an `@apply` - it
+	  has to be the literal custom property.
+
+	  It goes on ONE child of the strip, never on the strip itself, because a
+	  custom property inherits. Putting it on the strip made the buttons drag
+	  regions too, and the runtime defers the drag to the first mousemove
+	  (`deferDragToMouseMove`): a hand that moved one pixel between press and
+	  release turned every click into a window drag, so every button took two
+	  tries. A drag region and a button must never overlap.
+	*/
+	.titlebar-drag {
+		--wails-draggable: drag;
+	}
+
+	/* The buttons sit outside the drag region, so they are plain buttons
+	   again. The cursor is spelled out because inside a strip that drags, the
+	   default pointer would promise something untrue. */
+	.titlebar button {
+		cursor: default;
+	}
+
+	/* A gold hairline, the frame every panel in the launcher look wears. */
+	.gold-frame {
+		border: 1px solid rgba(199, 161, 90, 0.22);
+		background: linear-gradient(180deg, rgba(21, 31, 43, 0.9), rgba(12, 18, 26, 0.94));
+		box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+	}
+
+	.crest {
+		display: grid;
+		place-items: center;
+		width: 3.5rem;
+		height: 3.5rem;
+		background: linear-gradient(145deg, #172d43, #0a1119);
+		border: 1px solid var(--gold-dim);
+		clip-path: polygon(50% 0, 92% 18%, 100% 61%, 50% 100%, 0 61%, 8% 18%);
+	}
+}
