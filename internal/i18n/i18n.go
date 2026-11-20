@@ -71,11 +71,18 @@ func Known(lang string) bool { return known(lang) }
 
 var current atomic.Value // holds string
 
+// decided says someone has chosen a language on purpose - through Set() from
+// a settings file, a test, or the picker. Detection only runs when nobody
+// has: an explicit choice, even one made before the settings file was read,
+// must not be overruled by the OS locale.
+var decided atomic.Bool
+
 // Set switches the language. An unknown code is ignored rather than trusted:
 // a settings file edited by hand must not leave the panel saying nothing.
 func Set(lang string) {
 	if known(lang) {
 		current.Store(lang)
+		decided.Store(true)
 	}
 }
 
@@ -88,14 +95,19 @@ func L() string {
 }
 
 // Init applies the saved choice, or detects one from the OS for a fresh
-// install. An empty or unknown saved value means "no decision yet", which is
-// exactly the case detection exists for.
+// install. An empty or unknown saved value means "no decision yet" - but only
+// as far as the settings file is concerned: if Set already chose a language
+// in this process, that choice stands and the OS is not asked. This is what
+// keeps the tests deterministic on any machine: they pin a language up front,
+// and constructing an App cannot silently re-detect it.
 func Init(saved string) {
 	if known(saved) {
 		Set(saved)
 		return
 	}
-	Set(Detect())
+	if !decided.Load() {
+		Set(Detect())
+	}
 }
 
 // T returns the translation of key in the current language.
