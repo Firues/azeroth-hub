@@ -1,0 +1,15 @@
+Azeroth Hub — control panel for a local AzerothCore server.
+
+Install:
+1. Copy wow-hub.exe into your repack root — the folder that contains
+   worldserver.exe, configs/ and data/dbc.
+2. Run it. The checklist on the first screen says if anything is missing.
+3. Backups need 7-Zip installed (https://www.7-zip.org/).
+
+Languages: English, Русский, 简体中文, Español, Português, Français, Deutsch —
+switch on the "More" screen.
+
+The panel is the only thing that should stop the stack: it shuts the world,
+then the login server, then the database down in that order, and refuses to
+stop the database while the world is still running. Stopping MySQL first is
+how characters get lost.

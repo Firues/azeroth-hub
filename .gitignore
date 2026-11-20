@@ -1,0 +1,16 @@
+# Generated per build by the recipe in AGENTS.md section 4; never committed.
+frontend/bindings/
+frontend/dist/
+frontend/node_modules/
+node_modules/
+rsrc_windows_amd64.syso
+build/bin/
+
+# Machine-local state: the settings file remembers when THIS machine last
+# made a rollback point, and logs/ holds what the panel wrote on it.
+wow-hub.settings.json
+logs/
+
+# Design reference that led to the current look, kept out of the repo on
+# purpose - it is a prototype, not documentation.
+wow_launcher_reference.html
