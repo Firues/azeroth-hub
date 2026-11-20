@@ -1071,6 +1071,13 @@ func TestARestoreIsNotCancellable(t *testing.T) {
 func TestRestoreSnapshotRefusesWhileABackupRuns(t *testing.T) {
 	f := restoreFixture(t)
 
+	// The backup goroutine has to get as far as its first dump for the refusal
+	// to be about the race this test names. Without a port listening on 3306
+	// it fails at checkLogical instead, and whether RestoreSnapshot still sees
+	// the backup as running becomes a race between the goroutine and the next
+	// line - which a slow CI runner loses.
+	f.ops.Listening[3306] = true
+
 	release := make(chan struct{})
 	f.ops.OnRunTo = func(ctx context.Context, _ string, _ []string, _ string, out io.Writer) (string, error) {
 		<-release
