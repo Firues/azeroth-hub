@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,9 @@ type appFixture struct {
 	ops    *osops.FakeOps
 	clk    *osops.FakeClock
 	sink   *notify.Recorder
+	// gate, when set, is what the App emits through instead of the bare
+	// recorder - see gateSink.
+	gate   *gateSink
 	lay    repack.Layout
 	pinger *okPinger
 	// started records the launch order, which is how Restart is checked.
@@ -90,11 +94,20 @@ func (f *appFixture) deps() Deps {
 	return Deps{
 		Supervisor: f.sup,
 		Health:     health.NewRunner(f.ops, f.lay, f.pinger),
-		Sink:       f.sink,
+		Sink:       f.outSink(),
 		Ops:        f.ops,
 		Layout:     f.lay,
 		Clock:      f.clk,
 	}
+}
+
+// outSink is what the App emits through: the recorder, or a gate wrapped
+// around it when a test froze an operation at a known point.
+func (f *appFixture) outSink() notify.Sink {
+	if f.gate != nil {
+		return f.gate
+	}
+	return f.sink
 }
 
 func testLayout() repack.Layout {
@@ -952,10 +965,9 @@ func TestCreateBackupRefreshesThePointListOnSuccess(t *testing.T) {
 
 // --- restoring --------------------------------------------------------------
 
-// restoreFixture is a repack with a physical point and an archiver that can
-// be told to fail, so the whole three-step path can be driven through the
-// App's own binding.
-func restoreFixture(t *testing.T) *appFixture {
+// restoreFixture is a repack with a physical point, so the whole three-step
+// path can be driven through the App's own binding.
+func restoreFixture(t *testing.T, mutate ...func(*appFixture)) *appFixture {
 	t.Helper()
 
 	lay := realRepack(t)
@@ -970,7 +982,32 @@ func restoreFixture(t *testing.T) *appFixture {
 		t.Fatalf("write archive: %v", err)
 	}
 
-	return newAppFixture(t, func(f *appFixture) { f.lay = lay })
+	mutate = append([]func(*appFixture){func(f *appFixture) { f.lay = lay }}, mutate...)
+	return newAppFixture(t, mutate...)
+}
+
+// gateSink passes events through to an inner sink, and holds the first
+// restore progress report from the safety-copy step open until released. It
+// is how a test can act on the app in the middle of an operation: the emit
+// happens after the state is stored and before the work of that step, so a
+// caller blocked there has the operation frozen at a known point.
+type gateSink struct {
+	inner   notify.Sink
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *gateSink) Emit(e notify.Event) {
+	if e.Type == notify.EventBackup {
+		if st, ok := e.Data.(BackupStatus); ok && st.Kind == restore.Kind && st.Index >= 2 {
+			s.once.Do(func() { close(s.reached) })
+			// Released stays readable forever once closed, so later
+			// emissions of the same shape flow straight through.
+			<-s.release
+		}
+	}
+	s.inner.Emit(e)
 }
 
 // writePointArchive writes the mysql_data.zip a physical point holds: the
@@ -1047,22 +1084,23 @@ func TestRestoreSnapshotNamesTheSafetyCopyAndLeavesTheStackDown(t *testing.T) {
 // is running, the archive is being unpacked over mysql\data, and half of that
 // is a state neither the panel nor the user can reason about.
 //
-// CancelBackup is asked while the restore is under way; if it cancelled, the
-// operation would end with the cancellation error, and it must not.
+// The gate holds the restore at the safety-copy step, so CancelBackup is
+// called while the operation is genuinely frozen mid-way - deterministically,
+// with no race against how fast the steps run.
 func TestARestoreIsNotCancellable(t *testing.T) {
-	f := restoreFixture(t)
+	gate := &gateSink{reached: make(chan struct{}), release: make(chan struct{})}
+	f := restoreFixture(t, func(f *appFixture) {
+		gate.inner = f.sink
+		f.gate = gate
+	})
 
 	if err := f.app.RestoreSnapshot("20261002_121135_datadir"); err != nil {
 		t.Fatalf("RestoreSnapshot: %v", err)
 	}
-	// Wait until the operation is genuinely under way: the safety-copy step,
-	// reported before any work inside it happens.
-	waitFor(t, "старта восстановления", func() bool {
-		st := f.app.BackupStatus()
-		return st.Running && st.Index >= 2
-	})
+	<-gate.reached
 
 	f.app.CancelBackup()
+	close(gate.release)
 
 	waitFor(t, "окончания восстановления", func() bool { return !f.app.BackupStatus().Running })
 	if st := f.app.BackupStatus(); st.Err != "" {
