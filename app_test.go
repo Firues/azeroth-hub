@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"errors"
 	"fmt"
@@ -170,6 +171,7 @@ func realRepack(t *testing.T) repack.Layout {
 		filepath.Join(root, "configs"),
 		filepath.Join(root, "data", "dbc"),
 		filepath.Join(root, "mysql", "bin"),
+		filepath.Join(root, "mysql", "data"),
 		filepath.Join(root, "temp"),
 		filepath.Join(root, "backups"),
 	} {
@@ -183,7 +185,6 @@ func realRepack(t *testing.T) repack.Layout {
 	files := []string{
 		filepath.Join(root, "worldserver.exe"),
 		filepath.Join(root, "mysql", "bin", "mysqldump.exe"),
-		filepath.Join(root, "backups", "snapshot-mysql-data.cmd"),
 	}
 	for _, path := range files {
 		if err := os.WriteFile(path, nil, 0o644); err != nil {
@@ -193,6 +194,13 @@ func realRepack(t *testing.T) repack.Layout {
 	conf := "[client]\npassword = \"acore\"\n"
 	if err := os.WriteFile(filepath.Join(root, "temp", "mysql_ac.conf"), []byte(conf), 0o644); err != nil {
 		t.Fatalf("write mysql_ac.conf: %v", err)
+	}
+
+	// mysql\data: what a physical snapshot archives. A file with content, so
+	// a safety copy made by the built-in archiver carries something a test
+	// can find again.
+	if err := os.WriteFile(filepath.Join(root, "mysql", "data", "ibdata1"), []byte("live ibdata1"), 0o644); err != nil {
+		t.Fatalf("write mysql data: %v", err)
 	}
 
 	lay, err := repack.LocateFrom(root)
@@ -951,38 +959,42 @@ func restoreFixture(t *testing.T) *appFixture {
 	t.Helper()
 
 	lay := realRepack(t)
-	// The archiver is the repack's own path, not a path a test may choose:
-	// restore.Check stats it before it will touch anything.
-	sevenZip := filepath.Join(lay.Root, "7z.exe")
-	if err := os.WriteFile(sevenZip, []byte("MZ"), 0o644); err != nil {
-		t.Fatalf("write 7z: %v", err)
-	}
-	lay.SevenZipExe = sevenZip
 
 	dir := filepath.Join(lay.BackupsDir, "20261002_121135_datadir")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir point: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "mysql_data.7z"), []byte("archive"), 0o644); err != nil {
+	// A real archive, because the unpack is real now: the entries go back
+	// over mysql\data when the restore runs.
+	if err := writePointArchive(dir); err != nil {
 		t.Fatalf("write archive: %v", err)
 	}
 
-	f := newAppFixture(t, func(f *appFixture) { f.lay = lay })
+	return newAppFixture(t, func(f *appFixture) { f.lay = lay })
+}
 
-	// The snapshot script names its own folder and the runner learns which one
-	// by looking before and after, so the fake has to make a folder when it is
-	// that script being run. Anything else - the 7z call - just succeeds.
-	f.ops.OnRunTo = func(ctx context.Context, exe string, args []string, _ string, _ io.Writer) (string, error) {
-		if !slices.Contains(args, "snapshot-mysql-data.cmd") {
-			return "", nil
-		}
-		dir := filepath.Join(lay.BackupsDir, "20261002_130000_safety_datadir")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", err
-		}
-		return "", os.WriteFile(filepath.Join(dir, "mysql_data.7z"), []byte("archive"), 0o644)
+// writePointArchive writes the mysql_data.zip a physical point holds: the
+// same entry shape the archiver produces.
+func writePointArchive(dir string) error {
+	f, err := os.Create(filepath.Join(dir, dumps.ArchiveName))
+	if err != nil {
+		return err
 	}
-	return f
+	defer f.Close()
+
+	zw := zip.NewWriter(f)
+	for name, body := range map[string]string{
+		"mysql/data/ibdata1": "restored ibdata1",
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			return err
+		}
+	}
+	return zw.Close()
 }
 
 func TestRestoreSnapshotRefusesANameThatIsNotAPoint(t *testing.T) {
@@ -1034,30 +1046,23 @@ func TestRestoreSnapshotNamesTheSafetyCopyAndLeavesTheStackDown(t *testing.T) {
 // A restore is the one operation that must not be cancellable. By the time it
 // is running, the archive is being unpacked over mysql\data, and half of that
 // is a state neither the panel nor the user can reason about.
+//
+// CancelBackup is asked while the restore is under way; if it cancelled, the
+// operation would end with the cancellation error, and it must not.
 func TestARestoreIsNotCancellable(t *testing.T) {
 	f := restoreFixture(t)
-
-	// Only the unpack is held open. The snapshot script before it has to run
-	// normally, and the fixture's own handler is what makes its folder.
-	safety := f.ops.OnRunTo
-	release := make(chan struct{})
-	f.ops.OnRunTo = func(ctx context.Context, exe string, args []string, dir string, out io.Writer) (string, error) {
-		if slices.Contains(args, "snapshot-mysql-data.cmd") {
-			return safety(ctx, exe, args, dir, out)
-		}
-		<-release
-		return "", nil
-	}
 
 	if err := f.app.RestoreSnapshot("20261002_121135_datadir"); err != nil {
 		t.Fatalf("RestoreSnapshot: %v", err)
 	}
-	waitFor(t, "начала распаковки", func() bool {
-		return len(f.ops.RunToCalls) > 0
+	// Wait until the operation is genuinely under way: the safety-copy step,
+	// reported before any work inside it happens.
+	waitFor(t, "старта восстановления", func() bool {
+		st := f.app.BackupStatus()
+		return st.Running && st.Index >= 2
 	})
 
 	f.app.CancelBackup()
-	close(release)
 
 	waitFor(t, "окончания восстановления", func() bool { return !f.app.BackupStatus().Running })
 	if st := f.app.BackupStatus(); st.Err != "" {
@@ -1116,7 +1121,7 @@ func deleteFixture(t *testing.T) (*appFixture, repack.Layout) {
 	if err := os.MkdirAll(physical, 0o755); err != nil {
 		t.Fatalf("mkdir physical: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(physical, "mysql_data.7z"), []byte("archive"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(physical, "mysql_data.zip"), []byte("archive"), 0o644); err != nil {
 		t.Fatalf("write archive: %v", err)
 	}
 

@@ -1,12 +1,11 @@
-// Package backups reads the rollback points that the repack's own scripts
-// write into backups\.
+// Package backups reads the rollback points in backups\.
 //
-// Read-only, and deliberately so. The scripts (backup-table.cmd,
-// restore-table.cmd, snapshot-mysql-data.cmd, restore-all-db.cmd) own the
-// format; this package only reports what is on disk. Inventing a second
-// backup format in the app would produce two sets of files that look alike
-// and are not interchangeable, and the day someone needs a rollback is the
-// worst possible day to discover that.
+// Read-only, and deliberately so. The repack's hand scripts (backup-table.cmd,
+// restore-table.cmd, restore-all-db.cmd) own the logical formats, and the
+// panel's own archiver writes the physical ones; this package only reports
+// what is on disk. Inventing a second backup format here would produce two
+// sets of files that look alike and are not interchangeable, and the day
+// someone needs a rollback is the worst possible day to discover that.
 //
 // Resolve is the one thing here that is not reading: it turns a folder name
 // from the page into a path, and it is the guard every writer of backups\
@@ -99,7 +98,7 @@ const (
 	// KindLogical is a folder of per-database dumps: acore_world.sql and
 	// friends, made by mysqldump against a running MySQL.
 	KindLogical Kind = "logical"
-	// KindPhysical is a folder holding mysql_data.7z, a snapshot of the
+	// KindPhysical is a folder holding mysql_data.zip, a snapshot of the
 	// whole mysql\data directory taken with MySQL stopped.
 	KindPhysical Kind = "physical"
 	// KindTables is a folder of single-table dumps, as backup-table.cmd
@@ -214,7 +213,7 @@ func describe(path, name string) Point {
 		base := d.Name()
 		lower := strings.ToLower(base)
 
-		if lower == "mysql_data.7z" {
+		if lower == "mysql_data.zip" {
 			hasArchive = true
 			return nil
 		}
@@ -288,7 +287,7 @@ func missingDatabases(present []string) []string {
 
 // stampWithTime reads a full timestamp out of a folder name.
 //
-// Only snapshot-mysql-data.cmd writes one: "20260930_075446_datadir".
+// The panel's own archiver writes one: "20260930_075446_datadir".
 func stampWithTime(name string) (time.Time, bool) {
 	const layout = "20060102_150405"
 	if len(name) < len(layout) {

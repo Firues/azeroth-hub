@@ -1,37 +1,51 @@
 package restore
 
 import (
+	"archive/zip"
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"wow-hub/internal/i18n"
 	"wow-hub/internal/osops"
 	"wow-hub/internal/repack"
 )
+
+func TestMain(m *testing.M) {
+	// The assertions pin exact Russian wording; the process-wide language
+	// defaults to English now, so the tests pin theirs explicitly.
+	i18n.Set(i18n.Ru)
+	os.Exit(m.Run())
+}
+
+// pointEntries is what a test point's archive holds: the shape of a real
+// mysql\data snapshot, small enough to build in every fixture.
+var pointEntries = map[string]string{
+	"mysql/data/ibdata1":                   "new ibdata1",
+	"mysql/data/acore_world/character.ibd": "new character.ibd",
+}
 
 // fixture builds a repack on disk with one physical point in it.
 //
 // Real directories rather than fakes for the paths: the whole risk in this
 // package is resolving a name the page sent into a file, and that risk lives
-// in os.Stat and filepath.Join, which no fake would reproduce.
+// in os.Stat and filepath.Join, which no fake would reproduce. The archiver
+// is in the exe now, so the unpack below is a real unpack - which is why the
+// fixture also puts a live mysql\data on disk, for the assertions to tell
+// "the archive went back over it" from "nothing happened".
 func fixture(t *testing.T, points ...string) (repack.Layout, *osops.FakeOps) {
 	t.Helper()
 	root := t.TempDir()
 
-	for _, dir := range []string{"backups", "mysql\\bin", filepath.Join("mysql", "bin")} {
+	for _, dir := range []string{"backups", filepath.Join("mysql", "bin"), filepath.Join("mysql", "data")} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
 	}
-
-	// The archiver has to exist for Check to pass, and it is the repack's own
-	// path rather than anything a test chose.
-	sevenZip := filepath.Join(root, "7z.exe")
-	if err := os.WriteFile(sevenZip, nil, 0o644); err != nil {
-		t.Fatalf("write 7z: %v", err)
+	if err := os.WriteFile(filepath.Join(root, "mysql", "data", "ibdata1"), []byte("live ibdata1"), 0o644); err != nil {
+		t.Fatalf("write live data: %v", err)
 	}
 
 	for _, p := range points {
@@ -39,17 +53,40 @@ func fixture(t *testing.T, points ...string) (repack.Layout, *osops.FakeOps) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("mkdir point: %v", err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, archiveName), []byte("archive"), 0o644); err != nil {
-			t.Fatalf("write archive: %v", err)
-		}
+		writePointZip(t, dir, pointEntries)
 	}
 
 	lay := repack.Layout{
-		Root:        root,
-		BackupsDir:  filepath.Join(root, "backups"),
-		SevenZipExe: sevenZip,
+		Root:       root,
+		BackupsDir: filepath.Join(root, "backups"),
 	}
 	return lay, osops.NewFake()
+}
+
+// writePointZip writes a real mysql_data.zip into dir, holding the named
+// entries.
+func writePointZip(t *testing.T, dir string, entries map[string]string) {
+	t.Helper()
+	f, err := os.Create(filepath.Join(dir, archiveName))
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+	zw := zip.NewWriter(f)
+	for name, body := range entries {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("zip entry %s: %v", name, err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatalf("zip entry %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
 }
 
 // A folder name is the one thing the page sends, and it becomes part of a
@@ -87,9 +124,7 @@ func TestArchiveOfStaysInsideTheBackupsFolder(t *testing.T) {
 	if err := os.MkdirAll(outside, 0o755); err != nil {
 		t.Fatalf("mkdir outside: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(outside, archiveName), []byte("x"), 0o644); err != nil {
-		t.Fatalf("write outside archive: %v", err)
-	}
+	writePointZip(t, outside, pointEntries)
 
 	if _, err := r.archiveOf("20261002_121135_datadir"); err != nil {
 		t.Fatalf("the real point was refused: %v", err)
@@ -116,23 +151,9 @@ func TestArchiveOfRefusesAMissingOrEmptyArchive(t *testing.T) {
 	}
 }
 
-func TestCheckSaysWhereItLookedForSevenZip(t *testing.T) {
-	lay, ops := fixture(t, "p_datadir")
-	lay.SevenZipExe = filepath.Join(lay.Root, "no-such-7z.exe")
-	r := New(ops, lay, osops.NewFakeClock(), nil)
-
-	_, err := r.Run(context.Background(), "p_datadir", okStop{}, nil)
-	if err == nil {
-		t.Fatal("Run proceeded without an archiver")
-	}
-	if !strings.Contains(err.Error(), lay.SevenZipExe) {
-		t.Errorf("the error does not name the path it looked for: %v", err)
-	}
-}
-
-// The happy path, asserted on the order of the calls rather than on words:
-// stop, then unpack, with the unpack going to the repack root and nothing
-// else.
+// The happy path, asserted on the result on disk rather than on the calls:
+// the stack is stopped, and the archive is back over mysql\data with the
+// entries it carried.
 func TestRunStopsTheStackThenUnpacksOverTheDataFolder(t *testing.T) {
 	lay, ops := fixture(t, "20261002_121135_datadir")
 	var steps []string
@@ -146,26 +167,23 @@ func TestRunStopsTheStackThenUnpacksOverTheDataFolder(t *testing.T) {
 	if stop.calls != 1 {
 		t.Fatalf("the stack was stopped %d times, expected once", stop.calls)
 	}
-	if len(ops.RunToCalls) != 1 {
-		t.Fatalf("7z ran %d times, expected once", len(ops.RunToCalls))
+	// Nothing external runs: the archiver is in the exe.
+	if len(ops.RunToCalls) != 0 {
+		t.Errorf("an external process was started, though the archiver is built in: %v", ops.RunToCalls)
 	}
 
-	call := ops.RunToCalls[0]
-	if call.Dir != lay.Root {
-		t.Errorf("7z ran in %s, expected the repack root %s", call.Dir, lay.Root)
+	// The archive's entries are back where they came from, over the live
+	// data the fixture put there.
+	body, err := os.ReadFile(filepath.Join(lay.Root, "mysql", "data", "ibdata1"))
+	if err != nil {
+		t.Fatalf("restored ibdata1: %v", err)
 	}
-	if filepath.Base(call.Exe) != filepath.Base(lay.SevenZipExe) {
-		t.Errorf("ran %s, expected %s", call.Exe, lay.SevenZipExe)
+	if string(body) != pointEntries["mysql/data/ibdata1"] {
+		t.Errorf("ibdata1 = %q, want the archived content", body)
 	}
-
-	// "-o." rather than an absolute path: the archive stores mysql\data\...,
-	// and a relative output root is what puts them back where they belong.
-	joined := strings.Join(call.Args, " ")
-	if !strings.Contains(joined, "-o.") {
-		t.Errorf("args %v do not unpack into the working directory", call.Args)
-	}
-	if !strings.Contains(joined, archiveName) {
-		t.Errorf("args %v do not name the archive", call.Args)
+	nested := filepath.Join(lay.Root, "mysql", "data", "acore_world", "character.ibd")
+	if body, err := os.ReadFile(nested); err != nil || string(body) != pointEntries["mysql/data/acore_world/character.ibd"] {
+		t.Errorf("nested character.ibd: %q, %v", body, err)
 	}
 
 	if rep.Elapsed < 0 {
@@ -193,8 +211,8 @@ func TestRunRefusesToUnpackWhenTheSafetyCopyFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run unpacked the archive without a safety copy")
 	}
-	if len(ops.RunToCalls) != 0 {
-		t.Error("7z ran even though the safety copy failed")
+	if body, rerr := os.ReadFile(filepath.Join(lay.Root, "mysql", "data", "ibdata1")); rerr != nil || string(body) != "live ibdata1" {
+		t.Errorf("the archive went back over the data despite the failed safety copy: %q, %v", body, rerr)
 	}
 }
 
@@ -224,26 +242,35 @@ func TestRunLeavesTheDataAloneWhenTheStackWillNotStop(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run unpacked while the world was still up")
 	}
-	if len(ops.RunToCalls) != 0 {
-		t.Error("7z ran even though the stop failed")
+	if body, rerr := os.ReadFile(filepath.Join(lay.Root, "mysql", "data", "ibdata1")); rerr != nil || string(body) != "live ibdata1" {
+		t.Errorf("the archive went back over the data despite the failed stop: %q, %v", body, rerr)
 	}
 }
 
-// 7-Zip's exit status is "cannot open archive"; its stderr says which file
-// and why, and that line is what a person can act on.
-func TestUnpackErrorSaysWhatSevenZipSaid(t *testing.T) {
-	lay, ops := fixture(t, "p_datadir")
-	ops.OnRunTo = func(ctx context.Context, exe string, args []string, dir string, out io.Writer) (string, error) {
-		return "ERROR: Can not open the file as archive\r\n", context.Canceled
-	}
+// An archive that is not a zip at all - a truncated download, a file renamed
+// by hand - must fail with a sentence, not with a half-replaced data folder.
+func TestUnpackRefusesACorruptArchive(t *testing.T) {
+	lay, ops := fixture(t)
 	r := New(ops, lay, osops.NewFakeClock(), nil)
 
-	_, err := r.Run(context.Background(), "p_datadir", &recordingStop{}, nil)
-	if err == nil {
-		t.Fatal("a failing 7z was reported as a success")
+	point := filepath.Join(lay.BackupsDir, "broken_datadir")
+	if err := os.MkdirAll(point, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "Can not open the file as archive") {
-		t.Errorf("7-Zip's own complaint was lost: %v", err)
+	if err := os.WriteFile(filepath.Join(point, archiveName), []byte("this is not a zip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := r.Run(context.Background(), "broken_datadir", &recordingStop{}, nil)
+	if err == nil {
+		t.Fatal("Run accepted an archive that is not a zip")
+	}
+	if !strings.Contains(err.Error(), "распаковка") {
+		t.Errorf("the error does not say the unpacking failed: %v", err)
+	}
+	// The corrupt archive never got as far as replacing anything.
+	if body, rerr := os.ReadFile(filepath.Join(lay.Root, "mysql", "data", "ibdata1")); rerr != nil || string(body) != "live ibdata1" {
+		t.Errorf("the corrupt archive touched the data folder: %q, %v", body, rerr)
 	}
 }
 

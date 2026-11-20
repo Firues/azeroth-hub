@@ -89,7 +89,7 @@ func fixture(t *testing.T) repack.Layout {
 			t.Fatalf("MkdirAll(%s): %v", d, err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(lay.BackupsDir, "20260930_075446_datadir", "mysql_data.7z"),
+	if err := os.WriteFile(filepath.Join(lay.BackupsDir, "20260930_075446_datadir", "mysql_data.zip"),
 		[]byte("x"), 0o644); err != nil {
 		t.Fatalf("write archive: %v", err)
 	}

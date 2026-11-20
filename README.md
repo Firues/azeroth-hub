@@ -24,7 +24,8 @@ Every push to `main` is compiled automatically by GitHub Actions; per-commit bui
 1. Copy `wow-hub.exe` into your **repack root** — the folder that contains `worldserver.exe`,
    `configs/` and `data/dbc`. The panel walks up from its own location to find them.
 2. Run it. The checklist on the first screen says what is missing, if anything.
-3. Backups need [7-Zip](https://www.7-zip.org/) installed (`C:\Program Files\7-Zip\7z.exe`).
+
+No other dependencies: the archiver for full copies is built into the exe.
 
 ## ✨ What it does
 
@@ -32,7 +33,7 @@ Every push to `main` is compiled automatically by GitHub Actions; per-commit bui
 |---|---|
 | **Correct stop order, always** | Stop = world → authserver → MySQL. `worldserver` writes to the database while it shuts down, so a MySQL that leaves first leaves the world writing into a dead connection — that is the path to losing a character. The panel refuses to stop MySQL while the world is up, no matter which button was pressed. |
 | **One window, not three consoles** | Start everything with one button, watch each service's state, memory and PID, start/stop/restart any service individually. |
-| **Rollback points** | Two kinds of copy: *without stopping the server* (four readable .sql dumps) and *full* (a 7-Zip snapshot of `mysql\data`, restorable with one button). Progress, cancel, and an outcome box that says where the folder went. Restores stop the stack, take a safety copy of the current state first, and tell you where that safety copy lives. |
+| **Rollback points** | Two kinds of copy: *without stopping the server* (four readable .sql dumps) and *full* (a zip snapshot of `mysql\data`, made by the panel's own archiver, restorable with one button). Progress, cancel, and an outcome box that says where the folder went. Restores stop the stack, take a safety copy of the current state first, and tell you where that safety copy lives. |
 | **A backup reminder that counts by the calendar** | Say "every N days" and the panel reminds (or, if you allow it, makes the point itself) — a week stays a week even if the window was never opened. |
 | **Health checks that name the fix** | Six checks: repack in place, MySQL process/port/ping, authserver port, world process. Every failure comes with what to do about it, in words. |
 | **Characters and accounts browser** | Searchable lists read straight from the realm database — read-only: the account query never touches passwords, salts or session keys. |

@@ -30,12 +30,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"wow-hub/internal/archive"
 	"wow-hub/internal/backups"
 	"wow-hub/internal/i18n"
 	"wow-hub/internal/osops"
@@ -44,9 +43,9 @@ import (
 
 // archiveName is what a physical point's folder holds.
 //
-// The repack's snapshot script names it, and this package only reads what
-// that script wrote.
-const archiveName = "mysql_data.7z"
+// The panel writes it itself, through internal/archive; the hand procedure
+// reads it with whatever unzip tool is at hand, because a zip is a zip.
+const archiveName = "mysql_data.zip"
 
 // Kind is the value App puts into BackupStatus.Kind while a restore runs, so
 // the page can tell it from a backup without a second struct.
@@ -142,15 +141,15 @@ func (r *Runner) archiveOf(name string) (string, error) {
 		return "", err
 	}
 
-	archive := filepath.Join(folder, archiveName)
-	info, err := os.Stat(archive)
+	archivePath := filepath.Join(folder, archiveName)
+	info, err := os.Stat(archivePath)
 	if err != nil {
 		return "", errors.New(i18n.Tf("restore.nofile", name, archiveName))
 	}
 	if info.Size() == 0 {
 		return "", errors.New(i18n.Tf("restore.empty", name))
 	}
-	return archive, nil
+	return archivePath, nil
 }
 
 // Run restores one point, in the order described in the package comment.
@@ -160,7 +159,7 @@ func (r *Runner) archiveOf(name string) (string, error) {
 func (r *Runner) Run(ctx context.Context, name string, stop Stopper, snap Snapshoter) (Report, error) {
 	rep := Report{}
 
-	archive, err := r.archiveOf(name)
+	archivePath, err := r.archiveOf(name)
 	if err != nil {
 		return rep, err
 	}
@@ -169,7 +168,7 @@ func (r *Runner) Run(ctx context.Context, name string, stop Stopper, snap Snapsh
 	}
 
 	start := r.now()
-	bytes := sizeOf(archive)
+	bytes := sizeOf(archivePath)
 
 	// 1. Stop the stack. Nothing else may start until the data is back.
 	r.emit(Progress{Step: i18n.T("restore.step.stop"), Index: 1, Total: Steps,
@@ -181,7 +180,7 @@ func (r *Runner) Run(ctx context.Context, name string, stop Stopper, snap Snapsh
 		return rep, fmt.Errorf("%s: %w", i18n.T("restore.notstopped"), err)
 	}
 
-	// 2. The safety copy, by the repack's own script, against the stopped
+	// 2. The safety copy, by the panel's own archiver, against the stopped
 	// MySQL it requires.
 	if snap != nil {
 		r.emit(Progress{Step: i18n.T("restore.step.safety"), Index: 2, Total: Steps,
@@ -196,7 +195,7 @@ func (r *Runner) Run(ctx context.Context, name string, stop Stopper, snap Snapsh
 	// 3. Unpack. This is the first step that changes anything.
 	r.emit(Progress{Step: i18n.T("restore.step.unpack"), Index: 3, Total: Steps,
 		Bytes: bytes, Elapsed: r.now().Sub(start)})
-	if err := r.unpack(ctx, archive); err != nil {
+	if err := r.unpack(ctx, archivePath); err != nil {
 		return rep, err
 	}
 
@@ -206,33 +205,31 @@ func (r *Runner) Run(ctx context.Context, name string, stop Stopper, snap Snapsh
 	return rep, nil
 }
 
-// unpack runs 7z over the archive.
+// unpack puts the archive back over the repack root.
 //
-// The working directory is the repack root and the output switch is "-o.",
-// exactly as backups\README.md documents the hand-written restore. The paths
-// inside the archive start with mysql\data\, so a relative output root puts
-// every file back where it came from; an absolute path would depend on 7-Zip
-// resolving it the way the README assumes.
+// The entries are stored rooted at mysql\data/, so unpacking into the root
+// puts every file back where it came from - the same shape backups\README.md
+// documents for the hand restore, and the same guard internal/archive applies
+// to every entry name.
 //
-// Not cancellable, and not watched. A killed 7z leaves mysql\data half
-// replaced, which is the one state this package exists to avoid - and the
-// safety copy is there, so a failure is recoverable by hand.
-func (r *Runner) unpack(ctx context.Context, archive string) error {
-	var out strings.Builder
-	// context.Background, deliberately: see above.
-	stderr, err := r.ops.RunTo(context.Background(), r.lay.SevenZipExe,
-		[]string{"x", archive, "-o.", "-y"}, r.lay.Root, io.Writer(&out))
-	if err != nil {
-		return unpackError(err, stderr, out.String())
+// Not cancellable, and not watched. The unpack is in-process now, but the
+// reason against cancelling stands: it is already past the point where the
+// stack is down and the archive is being unpacked over mysql\data, and a
+// half-replaced database directory is worse than a restore that runs to its
+// end. The safety copy is there, so a failure is recoverable by hand.
+func (r *Runner) unpack(ctx context.Context, archivePath string) error {
+	if err := archive.UnpackMySQLDataZip(ctx, archivePath, r.lay.Root); err != nil {
+		return fmt.Errorf("%s: %w", i18n.T("restore.unpack.fail"), err)
 	}
 	return nil
 }
 
 // check reports why a restore cannot start, or nil.
 //
-// The same three things, asked in the same order as the operation would fail
-// them: no repack, no archiver, no stack to stop. A refusal with a sentence
-// attached is what the button is worth; "exit status 1" is not.
+// No archiver check any more - the archiver is in the exe. What remains is
+// what nothing inside the exe can answer: a repack to unpack into, and an
+// environment to run in. A refusal with a sentence attached is what the
+// button is worth; "exit status 1" is not.
 func (r *Runner) check() error {
 	if r.lay.Root == "" {
 		return errors.New(i18n.T("restore.norepack"))
@@ -240,40 +237,10 @@ func (r *Runner) check() error {
 	if r.ops == nil {
 		return errors.New(i18n.T("restore.noenv"))
 	}
-	if _, err := os.Stat(r.lay.SevenZipExe); err != nil {
-		return errors.New(i18n.Tf("restore.no7zip", r.lay.SevenZipExe))
-	}
 	return nil
 }
 
-// unpackError turns a failed 7z into something a person can act on.
-//
-// 7-Zip's exit status on its own is "cannot open archive as archive"; its
-// stderr is where it says which file and why, and that line is the difference
-// between "битый архив" and "нет прав на папку".
-func unpackError(err error, stderr, stdout string) error {
-	msg := firstLine(stderr)
-	if msg == "" {
-		msg = firstLine(stdout)
-	}
-	if msg == "" {
-		return fmt.Errorf("%s: %w", i18n.T("restore.unpack.fail"), err)
-	}
-	return fmt.Errorf("%s: %s", i18n.T("restore.unpack.fail"), msg)
-}
-
-// firstLine is the first non-empty line, trimmed. Windows tools write "\r\n"
-// and plenty of leading noise, and a multi-line error does not fit in the
-// one-line result box.
-func firstLine(text string) string {
-	for _, line := range strings.Split(text, "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			return s
-		}
-	}
-	return ""
-}
-
+// sizeOf is the archive's size, the one figure known before any work starts.
 func sizeOf(path string) int64 {
 	if info, err := os.Stat(path); err == nil {
 		return info.Size()

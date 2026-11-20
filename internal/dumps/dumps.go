@@ -21,17 +21,16 @@
 package dumps
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
+	"wow-hub/internal/archive"
 	"wow-hub/internal/i18n"
 	"wow-hub/internal/osops"
 	"wow-hub/internal/repack"
@@ -47,30 +46,28 @@ const (
 	KindPhysical Kind = "physical"
 )
 
-// Names this package and the repack's scripts agree on.
+// Names this package writes into the backups folder and reads back from it.
 const (
 	// LogicalSuffix ends a folder of per-database dumps, as in
-	// 2026-09-29_bots_current. The scripts put it there; matching it keeps
-	// the app's points reading the same way as the hand-made ones.
+	// 2026-09-29_bots_current. The repack's hand scripts put it there;
+	// matching it keeps the app's points reading the same way as the
+	// hand-made ones.
 	LogicalSuffix = "_current"
-	// PhysicalSuffix ends a folder holding mysql_data.7z. The script
-	// builds this name itself.
+	// PhysicalSuffix ends a folder holding the mysql\data snapshot, as in
+	// 20260930_075446_datadir. This package builds the name now, but keeps
+	// the shape the old hand script used so the two read alike.
 	PhysicalSuffix = "_datadir"
-	// ArchiveName is the file the physical script writes.
-	ArchiveName = "mysql_data.7z"
-	// snapshotScript is the repack's own physical-snapshot script.
-	snapshotScript = "snapshot-mysql-data.cmd"
+	// ArchiveName is the file a physical point holds.
+	ArchiveName = "mysql_data.zip"
 )
 
 // stampLayout is the folder-name timestamp.
 //
-// Chosen to match what snapshot-mysql-data.cmd already writes
-// (20260930_075446_datadir), and read back by backups.describe's
-// stampWithTime, so a point made here dates and sorts correctly in the list
-// without any change to that code. A human-readable 2026-09-30_143000 would
-// not: that parser takes the first fifteen characters, and a name with
-// dashes in it parses as a bare date, which would place every point at
-// midnight on the day it was made.
+// Read back by backups.describe's stampWithTime, so a point made here dates
+// and sorts correctly in the list without any change to that code. A
+// human-readable 2026-09-30_143000 would not: that parser takes the first
+// fifteen characters, and a name with dashes in it parses as a bare date,
+// which would place every point at midnight on the day it was made.
 const stampLayout = "20060102_150405"
 
 // dumpTrailer is the line mysqldump writes after the last statement.
@@ -252,13 +249,18 @@ func (r *Runner) dumpOne(ctx context.Context, db, path string, index, total int,
 	return info.Size(), stderr, nil
 }
 
-// Physical archives mysql\data by running the repack's own script.
+// Physical archives mysql\data into its own point folder.
 //
-// The script owns the format, the exclusions (binlog.*), the compression
-// level and the refusal to run against a live database. Running it rather
-// than reimplementing it means a point made from this window is
-// indistinguishable from one made by hand, which is what the README's
-// rollback instructions assume.
+// The whole job lives in this process now: the folder is named and created
+// here, and the archive is written by internal/archive - entries rooted at
+// mysql/data/, binlog.* excluded, the same shape the hand script produced
+// and the repack's README restores. A point made from this window stays one
+// the hand procedure can unpack, and nothing outside the exe is needed to
+// make it.
+//
+// Cancellation is honoured during the write, which the 7-Zip script could
+// not offer: an in-process writer stops within a second of the context
+// ending, and cleanup removes the half-written folder it named.
 func (r *Runner) Physical(ctx context.Context) (Report, error) {
 	rep := Report{Kind: KindPhysical}
 	start := r.now()
@@ -270,49 +272,30 @@ func (r *Runner) Physical(ctx context.Context) (Report, error) {
 		return rep, errors.New(i18n.T("dump.cancelled"))
 	}
 
-	before := datadirFolders(r.lay.BackupsDir)
-
-	// Deliberately not ctx. Killing cmd.exe does not kill the 7-Zip it
-	// started: the archiver would keep running, writing into a folder this
-	// call then reports as failed and deletes underneath it. Cancellation
-	// is honoured before the script starts and not during, and the 31
-	// seconds it takes is short enough to wait out.
-	var out bytes.Buffer
-	stderr, err := r.ops.RunTo(context.Background(), osops.CmdExe(),
-		[]string{"/c", snapshotScript}, r.lay.BackupsDir, &out)
-
-	// The script names its own folder - it takes the timestamp from
-	// PowerShell - so the only way to learn which one it made is to look
-	// before and after. More robust than parsing its console output, which
-	// is written for a person and has already changed once.
-	dir := newestNewDatadir(r.lay.BackupsDir, before)
-
+	dir, err := r.makePhysicalDir()
 	if err != nil {
-		r.cleanup(dir, KindPhysical)
-		return Report{Kind: KindPhysical}, physicalError(err, stderr, out.String())
-	}
-
-	if dir == "" {
-		return rep, errors.New(i18n.Tf("dump.phys.nodir", PhysicalSuffix, r.lay.BackupsDir))
+		return rep, err
 	}
 	rep.Dir = dir
 
-	archive := filepath.Join(dir, ArchiveName)
-	info, serr := os.Stat(archive)
+	if err := r.archiveMySQLData(ctx, dir, start); err != nil {
+		r.cleanup(dir, KindPhysical)
+		return Report{Kind: KindPhysical}, err
+	}
+
+	archivePath := filepath.Join(dir, ArchiveName)
+	info, serr := os.Stat(archivePath)
 	if serr != nil {
 		r.cleanup(dir, KindPhysical)
-		return Report{Kind: KindPhysical}, fmt.Errorf("%s: %w", i18n.Tf("dump.phys.noarchive", archive), serr)
+		return Report{Kind: KindPhysical}, fmt.Errorf("%s: %w", i18n.Tf("dump.create.fail", archivePath), serr)
 	}
 	if info.Size() == 0 {
 		r.cleanup(dir, KindPhysical)
-		return Report{Kind: KindPhysical}, errors.New(i18n.Tf("dump.phys.empty", archive))
+		return Report{Kind: KindPhysical}, errors.New(i18n.Tf("dump.phys.empty", archivePath))
 	}
 
 	rep.Bytes = info.Size()
 	rep.Elapsed = time.Since(start)
-	if stderr != "" {
-		rep.Warnings = append(rep.Warnings, oneLine(stderr))
-	}
 	r.emit(Progress{
 		Kind: KindPhysical, Step: ArchiveName, Index: 1, Total: 1,
 		Bytes: rep.Bytes, Elapsed: rep.Elapsed,
@@ -349,15 +332,19 @@ func (r *Runner) checkLogical() error {
 
 // checkPhysical reports why a physical snapshot cannot be made, or nil.
 //
-// The script checks the same two processes itself. Doing it here as well is
-// not redundant: the script's refusal arrives as one line on a stdout we
-// captured, while this arrives as a sentence next to the button.
+// The live-process checks are also what the stop ladder is about: starting a
+// world while a snapshot runs, or snapshotting over a running one, is the
+// same mistake from either side. Stating them here means the refusal arrives
+// as a sentence next to the button.
 func (r *Runner) checkPhysical() error {
 	if r.lay.Root == "" {
 		return errors.New(i18n.T("dump.norepack"))
 	}
-	if _, err := os.Stat(filepath.Join(r.lay.BackupsDir, snapshotScript)); err != nil {
-		return errors.New(i18n.Tf("dump.noscript", snapshotScript, r.lay.BackupsDir))
+	// mysql\data is the thing being archived. The archiver refuses a missing
+	// one as well; catching it here keeps the refusal next to the button
+	// instead of inside a folder that would only be cleaned up again.
+	if _, err := os.Stat(filepath.Join(r.lay.Root, "mysql", "data")); err != nil {
+		return errors.New(i18n.T("dump.data.missing"))
 	}
 	if r.anyRunning("mysqld.exe") {
 		return errors.New(i18n.T("dump.mysql.off"))
@@ -413,6 +400,56 @@ func (r *Runner) makeLogicalDir() (string, error) {
 		}
 	}
 	return "", errors.New(i18n.Tf("dump.names.spent", base, stamp))
+}
+
+// makePhysicalDir creates the folder for a physical point and returns it.
+//
+// Same rules as makeLogicalDir: os.Mkdir, so the folder is always one this
+// call created, and the counter before the suffix so the name still ends
+// with _datadir for removable and backups.describe.
+func (r *Runner) makePhysicalDir() (string, error) {
+	base := r.lay.BackupsDir
+	stamp := r.now().Format(stampLayout)
+
+	for n := 1; n <= 100; n++ {
+		name := stamp + PhysicalSuffix
+		if n > 1 {
+			name = fmt.Sprintf("%s_%d%s", stamp, n, PhysicalSuffix)
+		}
+		dir := filepath.Join(base, name)
+
+		err := os.Mkdir(dir, 0o755)
+		if err == nil {
+			return dir, nil
+		}
+		if !os.IsExist(err) {
+			return "", fmt.Errorf("%s: %w", i18n.Tf("dump.create.fail", dir), err)
+		}
+	}
+	return "", errors.New(i18n.Tf("dump.names.spent", base, stamp))
+}
+
+// archiveMySQLData writes the mysql\data snapshot into the point folder and
+// reports its progress the way the logical dumps report theirs.
+func (r *Runner) archiveMySQLData(ctx context.Context, dir string, start time.Time) error {
+	zipPath := filepath.Join(dir, ArchiveName)
+
+	err := archive.CreateMySQLDataZip(ctx, r.lay.Root, zipPath, func(written int64) {
+		r.emit(Progress{
+			Kind: KindPhysical, Step: ArchiveName, Index: 1, Total: 1,
+			Bytes: written, Elapsed: r.now().Sub(start),
+		})
+	})
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return errors.New(i18n.T("dump.cancelled"))
+	}
+	if errors.Is(err, archive.ErrMissingData) {
+		return errors.New(i18n.T("dump.data.missing"))
+	}
+	return fmt.Errorf("%s: %w", i18n.Tf("dump.write.fail", ArchiveName), err)
 }
 
 // cleanup removes a folder this run created.
@@ -530,67 +567,6 @@ func verifyDump(path string) error {
 		return errors.New(i18n.Tf("dump.truncated", filepath.Base(path), dumpTrailer))
 	}
 	return nil
-}
-
-// datadirFolders lists the *_datadir folders under dir, as a set.
-func datadirFolders(dir string) map[string]bool {
-	out := map[string]bool{}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return out
-	}
-	for _, e := range entries {
-		if e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), PhysicalSuffix) {
-			out[e.Name()] = true
-		}
-	}
-	return out
-}
-
-// newestNewDatadir returns the path of the newest *_datadir folder that was
-// not present in before, or "" when there is none.
-func newestNewDatadir(dir string, before map[string]bool) string {
-	var fresh []string
-	for name := range datadirFolders(dir) {
-		if !before[name] {
-			fresh = append(fresh, name)
-		}
-	}
-	if len(fresh) == 0 {
-		return ""
-	}
-	// The name starts with a timestamp, so the lexicographically greatest
-	// is the most recent. Sorted rather than taken from the map, whose
-	// order is random, so two new folders could not be told apart.
-	sort.Strings(fresh)
-	return filepath.Join(dir, fresh[len(fresh)-1])
-}
-
-// physicalError explains a failed snapshot.
-//
-// The script's own output is included verbatim. That is where its reason
-// lives - it refuses a live MySQL, a missing mysql\data and a missing
-// 7-Zip, and each of those prints a sentence a person can act on - and
-// rewriting it in Russian here would be a second copy of a fact that
-// already exists in one place. Without it the error is an exit status.
-func physicalError(err error, stderr, stdout string) error {
-	if why := firstLineWith(stdout, "ERROR"); why != "" {
-		return errors.New(i18n.Tf("dump.snapshot.fail.msg", why))
-	}
-	if why := oneLine(stderr); why != "" {
-		return errors.New(i18n.Tf("dump.snapshot.fail.msg", why))
-	}
-	return fmt.Errorf("%s: %w", i18n.T("dump.snapshot.fail"), err)
-}
-
-// firstLineWith returns the first line containing want, trimmed.
-func firstLineWith(text, want string) string {
-	for _, line := range strings.Split(text, "\n") {
-		if line = strings.TrimSpace(line); strings.Contains(line, want) {
-			return line
-		}
-	}
-	return ""
 }
 
 // oneLine flattens a multi-line message into its first non-empty line.

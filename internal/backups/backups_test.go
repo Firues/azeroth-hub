@@ -47,7 +47,7 @@ func TestScanRecognisesEveryShapeTheScriptsWrite(t *testing.T) {
 	dir := t.TempDir()
 
 	// snapshot-mysql-data.cmd
-	write(t, filepath.Join(dir, "20260930_075446_datadir", "mysql_data.7z"), 1000, time.Time{})
+	write(t, filepath.Join(dir, "20260930_075446_datadir", "mysql_data.zip"), 1000, time.Time{})
 	// restore-all-db.cmd / the *_current folders
 	for _, db := range []string{"acore_world", "acore_characters", "acore_playerbots", "acore_auth"} {
 		write(t, filepath.Join(dir, "2026-09-29_bots_current", db+".sql"), 100, time.Time{})
@@ -113,7 +113,7 @@ func TestScanNamesTheDatabaseMissingFromALogicalDump(t *testing.T) {
 func TestScanPrefersTheTimeInTheNameAndFallsBackToTheNewestFile(t *testing.T) {
 	dir := t.TempDir()
 
-	write(t, filepath.Join(dir, "20260930_075446_datadir", "mysql_data.7z"), 10,
+	write(t, filepath.Join(dir, "20260930_075446_datadir", "mysql_data.zip"), 10,
 		time.Date(2026, 9, 30, 23, 0, 0, 0, time.Local))
 
 	// The name says only 29 September. The dump was written at 12:47.
@@ -150,7 +150,7 @@ func TestScanReportsAMissingFolderInsteadOfAnEmptyList(t *testing.T) {
 
 func TestScanSumsSizesAndReportsDiskSpace(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "a_datadir", "mysql_data.7z"), 300, time.Time{})
+	write(t, filepath.Join(dir, "a_datadir", "mysql_data.zip"), 300, time.Time{})
 	write(t, filepath.Join(dir, "b_current", "acore_world.sql"), 200, time.Time{})
 
 	ops := osops.NewFake()
@@ -247,7 +247,7 @@ func TestWithinDirComparesCleanedAbsolutePaths(t *testing.T) {
 // A nil Ops must not panic: the disk figure is decoration, the list is not.
 func TestScanSurvivesWithoutAnOps(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "a_datadir", "mysql_data.7z"), 10, time.Time{})
+	write(t, filepath.Join(dir, "a_datadir", "mysql_data.zip"), 10, time.Time{})
 
 	inv := Scan(nil, dir)
 	if len(inv.Points) != 1 {

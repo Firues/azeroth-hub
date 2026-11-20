@@ -1,6 +1,7 @@
 package dumps
 
 import (
+	"archive/zip"
 	"context"
 	"errors"
 	"fmt"
@@ -101,7 +102,19 @@ func newFixture(t *testing.T) *fixture {
 	write(t, filepath.Join(root, "worldserver.exe"), "")
 	write(t, filepath.Join(root, "mysql", "bin", "mysqldump.exe"), "")
 	write(t, filepath.Join(root, "temp", "mysql_ac.conf"), "[client]\npassword = \"acore\"\n")
-	write(t, filepath.Join(root, "backups", snapshotScript), "@echo off\n")
+
+	// mysql\data, the thing a physical snapshot archives: two InnoDB-looking
+	// files, a nested folder, and the binlog the archiver must leave out.
+	for _, p := range []string{
+		filepath.Join(root, "mysql", "data", "ibdata1"),
+		filepath.Join(root, "mysql", "data", "acore_world", "character.ibd"),
+		filepath.Join(root, "mysql", "data", "binlog.000123"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("создание %s: %v", filepath.Dir(p), err)
+		}
+		write(t, p, "data of "+filepath.Base(p))
+	}
 
 	lay, err := repack.LocateFrom(root)
 	if err != nil {
@@ -149,16 +162,10 @@ func (f *fixture) entries() []string {
 func (f *fixture) only() string {
 	f.t.Helper()
 	names := f.entries()
-	var folders []string
-	for _, n := range names {
-		if n != snapshotScript {
-			folders = append(folders, n)
-		}
+	if len(names) != 1 {
+		f.t.Fatalf("в backups %d папок, ожидалась одна: %v", len(names), names)
 	}
-	if len(folders) != 1 {
-		f.t.Fatalf("в backups %d папок, ожидалась одна: %v", len(folders), names)
-	}
-	return filepath.Join(f.backups, folders[0])
+	return filepath.Join(f.backups, names[0])
 }
 
 func (f *fixture) read(name string) string {
@@ -356,8 +363,8 @@ func TestLogicalRefusesWhileMySQLIsNotListening(t *testing.T) {
 	if len(f.ops.RunToCalls) != 0 {
 		t.Error("mysqldump был запущен, хотя база не отвечает")
 	}
-	if names := f.entries(); len(names) != 1 {
-		t.Errorf("в backups осталось %v, ожидался только скрипт", names)
+	if names := f.entries(); len(names) != 0 {
+		t.Errorf("в backups осталось %v, ожидался пустой backups", names)
 	}
 }
 
@@ -417,7 +424,7 @@ func TestLogicalRemovesTheWholeFolderWhenADumpFails(t *testing.T) {
 	// The point of the test: three of four dumps must not be left behind.
 	// restore-all-db.cmd would import them, skip the missing one and
 	// report success, leaving world and characters from different days.
-	if names := f.entries(); len(names) != 1 {
+	if names := f.entries(); len(names) != 0 {
 		t.Errorf("неполная точка отката осталась на диске: %v", names)
 	}
 }
@@ -435,7 +442,7 @@ func TestLogicalRemovesTheFolderWhenADumpIsTruncated(t *testing.T) {
 	if !strings.Contains(err.Error(), "оборван") {
 		t.Errorf("ошибка не говорит об обрыве: %v", err)
 	}
-	if names := f.entries(); len(names) != 1 {
+	if names := f.entries(); len(names) != 0 {
 		t.Errorf("оборванная точка отката осталась на диске: %v", names)
 	}
 }
@@ -486,91 +493,101 @@ func TestLogicalStopsAndCleansUpWhenCancelled(t *testing.T) {
 	if !strings.Contains(err.Error(), "отменено") {
 		t.Errorf("ошибка не говорит об отмене: %v", err)
 	}
-	if names := f.entries(); len(names) != 1 {
+	if names := f.entries(); len(names) != 0 {
 		t.Errorf("после отмены осталась папка: %v", names)
 	}
 }
 
 // --- the physical snapshot -------------------------------------------------
 
-func TestPhysicalRunsTheRepackScriptFromTheBackupsFolder(t *testing.T) {
-	f := newFixture(t)
-	script := filepath.Join(f.backups, snapshotScript)
-	f.ops.OnRunTo = func(_ context.Context, exe string, args []string, _ string, out io.Writer) (string, error) {
-		// The script makes its own folder; model that.
-		dir := filepath.Join(f.backups, "20260930_120000"+PhysicalSuffix)
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			return "", err
+// pointNames lists the *_datadir folders in backups.
+func (f *fixture) pointNames() []string {
+	f.t.Helper()
+	var names []string
+	for _, e := range f.entries() {
+		if strings.HasSuffix(e, PhysicalSuffix) {
+			names = append(names, e)
 		}
-		write(t, filepath.Join(dir, ArchiveName), "7z archive bytes")
-		if _, err := io.WriteString(out, "OK: 131000000 bytes\n"); err != nil {
-			return "", err
-		}
-		return "", nil
 	}
+	return names
+}
+
+// zipEntryNames reads an archive and lists its entry names.
+func zipEntryNames(t *testing.T, zipPath string) []string {
+	t.Helper()
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("открытие %s: %v", zipPath, err)
+	}
+	defer zr.Close()
+	var names []string
+	for _, zf := range zr.File {
+		names = append(names, zf.Name)
+	}
+	return names
+}
+
+func TestPhysicalArchivesMySQLDataItself(t *testing.T) {
+	f := newFixture(t)
 
 	rep, err := f.runner.Physical(context.Background())
 	if err != nil {
 		t.Fatalf("Physical: %v", err)
 	}
 
-	call := f.ops.RunToCalls[0]
-	if call.Exe != osops.CmdExe() {
-		t.Errorf("Exe = %q, want %q", call.Exe, osops.CmdExe())
+	// The folder is named by this package: the fake clock's stamp, ending in
+	// the suffix the list and the cleanup read.
+	want := filepath.Join(f.backups, "20260929_120000"+PhysicalSuffix)
+	if rep.Dir != want {
+		t.Errorf("Dir = %q, want %q", rep.Dir, want)
 	}
-	// The script is named bare and started from backups\ on purpose: the
-	// repack folder name contains parentheses, and cmd.exe mangles a
-	// quoted path containing them. The script resolves the root from %~dp0.
-	if !slices.Equal(call.Args, []string{"/c", snapshotScript}) {
-		t.Errorf("Args = %v, want [/c %s]", call.Args, snapshotScript)
+	// Nothing external was started: the archiver is in the exe.
+	if len(f.ops.RunToCalls) != 0 {
+		t.Errorf("запущен внешний процесс, хотя архиватор встроен: %v", f.ops.RunToCalls)
 	}
-	if call.Dir != f.backups {
-		t.Errorf("Dir = %q, want %q", call.Dir, f.backups)
+
+	zipPath := filepath.Join(rep.Dir, ArchiveName)
+	info, err := os.Stat(zipPath)
+	if err != nil {
+		t.Fatalf("архив %s: %v", zipPath, err)
 	}
-	if _, err := os.Stat(script); err != nil {
-		t.Errorf("скрипт не там, где его ищет RunTo: %v", err)
+	if rep.Bytes != info.Size() {
+		t.Errorf("Bytes = %d, want %d", rep.Bytes, info.Size())
 	}
-	if rep.Dir != filepath.Dir(filepath.Join(f.backups, "20260930_120000"+PhysicalSuffix, ArchiveName)) {
-		t.Errorf("Dir = %q, want папку, созданную скриптом", rep.Dir)
+
+	names := zipEntryNames(t, zipPath)
+	for _, n := range names {
+		if !strings.HasPrefix(n, "mysql/data/") {
+			t.Errorf("запись не укоренена в mysql/data/: %s", n)
+		}
+		if strings.Contains(strings.ToLower(n), "binlog") {
+			t.Errorf("binlog попал в архив: %s", n)
+		}
 	}
-	if rep.Bytes != int64(len("7z archive bytes")) {
-		t.Errorf("Bytes = %d, want %d", rep.Bytes, len("7z archive bytes"))
+	if !slices.Contains(names, "mysql/data/acore_world/character.ibd") {
+		t.Errorf("файл баз данных не в архиве: %v", names)
 	}
 }
 
-func TestPhysicalIgnoresOlderDatadirFolders(t *testing.T) {
+func TestPhysicalAddsACounterWhenTheNameIsTaken(t *testing.T) {
 	f := newFixture(t)
-	// Three points already there, as on the real repack. The new one is
-	// the lexicographically greatest only because it is the newest, so a
-	// picker that took any of them would be caught.
-	for _, name := range []string{"20260929_094649", "20260929_124551", "20260930_075446"} {
-		dir := filepath.Join(f.backups, name+PhysicalSuffix)
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			t.Fatalf("подготовка %s: %v", dir, err)
-		}
-		write(t, filepath.Join(dir, ArchiveName), "old")
-	}
-	f.ops.OnRunTo = func(_ context.Context, _ string, _ []string, _ string, _ io.Writer) (string, error) {
-		dir := filepath.Join(f.backups, "20260930_120000"+PhysicalSuffix)
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			return "", err
-		}
-		write(t, filepath.Join(dir, ArchiveName), "new")
-		return "", nil
+	// The name the fake clock produces, already taken - two snapshots in one
+	// second would collide the same way.
+	taken := filepath.Join(f.backups, "20260929_120000"+PhysicalSuffix)
+	if err := os.Mkdir(taken, 0o755); err != nil {
+		t.Fatal(err)
 	}
 
 	rep, err := f.runner.Physical(context.Background())
 	if err != nil {
 		t.Fatalf("Physical: %v", err)
 	}
-	if want := filepath.Join(f.backups, "20260930_120000"+PhysicalSuffix); rep.Dir != want {
+	if want := filepath.Join(f.backups, "20260929_120000_2"+PhysicalSuffix); rep.Dir != want {
 		t.Errorf("Dir = %q, want %q", rep.Dir, want)
 	}
-	// And the older ones are untouched.
-	for _, name := range []string{"20260929_094649", "20260929_124551", "20260930_075446"} {
-		if got := f.read(filepath.Join(f.backups, name+PhysicalSuffix, ArchiveName)); got != "old" {
-			t.Errorf("старая точка %s изменена: %q", name, got)
-		}
+	// The taken folder is not ours to touch: a counter, not a cleanup.
+	if names := f.pointNames(); len(names) != 2 {
+		t.Errorf("папки точек: %v", names)
 	}
 }
 
@@ -585,8 +602,8 @@ func TestPhysicalRefusesWhileMySQLIsRunning(t *testing.T) {
 	if !strings.Contains(err.Error(), "MySQL") {
 		t.Errorf("ошибка не называет причину: %v", err)
 	}
-	if len(f.ops.RunToCalls) != 0 {
-		t.Error("скрипт был запущен, хотя база работает")
+	if names := f.pointNames(); len(names) != 0 {
+		t.Errorf("папка точки создана до проверки: %v", names)
 	}
 }
 
@@ -603,66 +620,46 @@ func TestPhysicalRefusesWhileWorldserverIsRunning(t *testing.T) {
 	}
 }
 
-func TestPhysicalRepeatsWhatTheScriptSaidWhenItRefuses(t *testing.T) {
+func TestPhysicalRefusesWhenMySQLDataIsMissing(t *testing.T) {
 	f := newFixture(t)
-	f.ops.OnRunTo = func(_ context.Context, _ string, _ []string, _ string, out io.Writer) (string, error) {
-		// What the real script prints when 7-Zip is missing.
-		_, _ = io.WriteString(out, "ERROR: 7-Zip not found at \"C:\\Program Files\\7-Zip\\7z.exe\"\n")
-		return "", errors.New("exit status 1")
+	if err := os.RemoveAll(filepath.Join(f.root, "mysql", "data")); err != nil {
+		t.Fatal(err)
 	}
 
 	_, err := f.runner.Physical(context.Background())
 	if err == nil {
-		t.Fatal("Physical прошёл, хотя скрипт упал")
+		t.Fatal("Physical прошёл без mysql\\data")
 	}
-	// Without the script's own line the error is just an exit status, and
-	// a user cannot act on that.
-	if !strings.Contains(err.Error(), "7-Zip not found") {
-		t.Errorf("ошибка не повторяет сообщение скрипта: %v", err)
+	if !strings.Contains(err.Error(), `mysql\data`) {
+		t.Errorf("ошибка не называет mysql\\data: %v", err)
+	}
+	if names := f.pointNames(); len(names) != 0 {
+		t.Errorf("папка точки создана до проверки: %v", names)
 	}
 }
 
-func TestPhysicalRemovesTheFolderTheScriptLeftBehindOnFailure(t *testing.T) {
+func TestPhysicalStopsWhenCancelledMidArchive(t *testing.T) {
 	f := newFixture(t)
-	f.ops.OnRunTo = func(_ context.Context, _ string, _ []string, _ string, out io.Writer) (string, error) {
-		// The script makes the folder before it starts archiving, so a
-		// failed 7-Zip leaves an empty one.
-		dir := filepath.Join(f.backups, "20260930_120000"+PhysicalSuffix)
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			return "", err
-		}
-		_, _ = io.WriteString(out, "ERROR: 7-Zip failed. The archive is incomplete - do not trust it.\n")
-		return "", errors.New("exit status 1")
+	// One file far bigger than a progress step, and the cancel fires from the
+	// progress report itself - deterministic, with no race against how fast
+	// deflate happens to be on this machine.
+	big := filepath.Join(f.root, "mysql", "data", "ibdata1")
+	if err := os.WriteFile(big, make([]byte, 64<<20), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	if _, err := f.runner.Physical(context.Background()); err == nil {
-		t.Fatal("Physical прошёл, хотя скрипт упал")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := New(f.ops, f.lay, f.clock, func(Progress) { cancel() })
+	_, err := runner.Physical(ctx)
+	if err == nil {
+		t.Fatal("Physical прошёл при отменённом контексте")
 	}
-	if names := f.entries(); len(names) != 1 {
+	if !strings.Contains(err.Error(), "отменено") {
+		t.Errorf("ошибка не говорит об отмене: %v", err)
+	}
+	if names := f.pointNames(); len(names) != 0 {
 		t.Errorf("папка неудавшегося слепка осталась: %v", names)
-	}
-}
-
-func TestPhysicalRefusesAnEmptyArchive(t *testing.T) {
-	f := newFixture(t)
-	f.ops.OnRunTo = func(_ context.Context, _ string, _ []string, _ string, _ io.Writer) (string, error) {
-		dir := filepath.Join(f.backups, "20260930_120000"+PhysicalSuffix)
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			return "", err
-		}
-		write(t, filepath.Join(dir, ArchiveName), "")
-		return "", nil
-	}
-
-	_, err := f.runner.Physical(context.Background())
-	if err == nil {
-		t.Fatal("Physical принял пустой архив")
-	}
-	if !strings.Contains(err.Error(), "пуст") {
-		t.Errorf("ошибка не говорит про пустой архив: %v", err)
-	}
-	if names := f.entries(); len(names) != 1 {
-		t.Errorf("папка с пустым архивом осталась: %v", names)
 	}
 }
 
@@ -674,8 +671,8 @@ func TestPhysicalDoesNotStartWhenTheContextIsAlreadyCancelled(t *testing.T) {
 	if _, err := f.runner.Physical(ctx); err == nil {
 		t.Fatal("Physical прошёл с отменённым контекстом")
 	}
-	if len(f.ops.RunToCalls) != 0 {
-		t.Error("скрипт запущен, хотя работа была уже отменена")
+	if names := f.pointNames(); len(names) != 0 {
+		t.Errorf("папка точки создана при отменённом контексте: %v", names)
 	}
 }
 

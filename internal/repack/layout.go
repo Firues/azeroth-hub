@@ -28,11 +28,6 @@ type Layout struct {
 	// implementation of charset handling and escaping, and the existing
 	// dumps in backups\ were made by this binary.
 	MySQLdumpExe string
-	// SevenZipExe unpacks a physical snapshot. The repack's
-	// snapshot-mysql-data.cmd writes down the same path itself, and the
-	// repack's README restores with it by hand - so this is that path, not
-	// a search for whatever 7-Zip happens to be installed.
-	SevenZipExe string
 
 	WorldConf     string
 	AuthConf      string
@@ -69,15 +64,6 @@ type Layout struct {
 	// describe a realm that is no longer the one next to it.
 	SettingsFile string
 }
-
-// DefaultSevenZip is where 7-Zip lives on the machine this repack was
-// measured on.
-//
-// The same path backups\snapshot-mysql-data.cmd writes down, which is why it
-// is a constant here rather than a lookup: a restore that found a different
-// 7-Zip than the snapshot was made with would be a second thing to keep
-// correct, and the script is the format's owner.
-const DefaultSevenZip = `C:\Program Files\7-Zip\7z.exe`
 
 // The four schemas, named once. Code that needs a specific one uses the
 // constant; code that needs all of them uses Databases.
@@ -187,7 +173,6 @@ func newLayout(root string) Layout {
 		MySQLdExe:      filepath.Join(root, "mysql", "bin", "mysqld.exe"),
 		MySQLadminExe:  filepath.Join(root, "mysql", "bin", "mysqladmin.exe"),
 		MySQLdumpExe:   filepath.Join(root, "mysql", "bin", "mysqldump.exe"),
-		SevenZipExe:    DefaultSevenZip,
 		WorldConf:      filepath.Join(root, "configs", "worldserver.conf"),
 		AuthConf:       filepath.Join(root, "configs", "authserver.conf"),
 		MySQLPassConf:  filepath.Join(root, "temp", "mysql_ac.conf"),
